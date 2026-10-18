@@ -79,6 +79,7 @@ SDLJoystick *joystick = NULL;
 #include "Core/System.h"
 #include "Core/Core.h"
 #include "Core/Config.h"
+#include "Core/CoreTiming.h"
 #include "Core/ConfigValues.h"
 #include "SDLGLGraphicsContext.h"
 #if defined(PPSSPP_SDL_HAS_VULKAN)
@@ -1040,10 +1041,15 @@ static void EmuThreadFunc(GraphicsContext *graphicsContext) {
 
 static void EmuThreadStart(GraphicsContext *context) {
 #ifdef __EMSCRIPTEN__
-	// On Emscripten the browser main thread cannot block on Atomics.wait,
-	// so we cannot use a worker thread for the emu loop together with the
-	// condition-variable fence in GLRenderManager.  Run everything on the
-	// main thread instead (DISABLED == no separate emu thread).
+#ifdef PPSSPP_WASM_THREADED_ADHOC
+	// Render queue draining stays nonblocking on the browser thread. Only
+	// the emulation worker waits for GL fences, leaving WebSocket delivery free.
+	if (g_Config.bEnableWlan) {
+		emuThreadState = (int)EmuThreadState::START_REQUESTED;
+		emuThread = std::thread(&EmuThreadFunc, context);
+		return;
+	}
+#endif
 	emuThreadState = (int)EmuThreadState::DISABLED;
 #else
 	emuThreadState = (int)EmuThreadState::START_REQUESTED;
@@ -1655,12 +1661,17 @@ extern "C" EMSCRIPTEN_KEEPALIVE void PPSSPP_ToggleFullscreen() {
 
 static void UpdateEmscriptenMainLoopTiming() {
 #if PPSSPP_WASM_MAIN_LOOP_FPS >= 0
-	static int lastTimeoutMs = 0;
 	const int fps = EmscriptenMainLoopFPS();
-	const int timeoutMs = std::max(1, (int)(1000.0f / fps));
-	if (timeoutMs != lastTimeoutMs) {
+	// WebSocket delivery shares this thread with NativeFrame.  A display-rate
+	// callback adds a full frame of delay before the PSP can read a reply.
+	// Keep network callbacks responsive; sceDisplay still paces the PSP clock.
+	const int timeoutMs = g_Config.bEnableWlan ? 4 : std::max(1, (int)(1000.0f / fps));
+	int mode = 0;
+	int interval = 0;
+	emscripten_get_main_loop_timing(&mode, &interval);
+	// SDL_GL_SetSwapInterval can switch the scheduler back to RAF after startup.
+	if (mode != EM_TIMING_SETTIMEOUT || interval != timeoutMs) {
 		emscripten_set_main_loop_timing(EM_TIMING_SETTIMEOUT, timeoutMs);
-		lastTimeoutMs = timeoutMs;
 		WASM_TRACE("Emscripten main loop timing timeout=%dms fps=%d", timeoutMs, fps);
 	}
 #endif
@@ -1678,6 +1689,33 @@ struct EmscriptenMainLoopState {
 	int mode;
 	int forceGLVersion;
 };
+
+static bool EmscriptenNetworkFrameDue() {
+	static bool tracking = false;
+	static double origin = 0.0;
+	static u64 emulatedOrigin = 0;
+	if (!g_Config.bEnableWlan || !PSP_IsInited() || GetUIState() != UISTATE_INGAME) {
+		tracking = false;
+		return true;
+	}
+	const double now = time_now_d();
+	const u64 emulated = CoreTiming::GetGlobalTimeUs();
+	const double elapsed = emulated >= emulatedOrigin ? (emulated - emulatedOrigin) / 1000000.0 : -1.0;
+	// sleep_precise is a no-op on the browser main thread. Pace against the
+	// emulated clock without blocking WebSocket events, including static menus
+	// where there may be no flips. Reset after pauses, reloads or long stalls.
+	if (!tracking || elapsed < 0.0 || std::abs((now - origin) - elapsed) > 0.1) {
+		tracking = true;
+		origin = now;
+		emulatedOrigin = emulated;
+		return true;
+	}
+	// NativeFrame ends at the next vblank. Start it up to one display period
+	// ahead, rather than waiting until its completion deadline to begin work.
+	// Otherwise adaptive skipping sees every rendered frame as already late.
+	const double frameLead = 1.0 / std::clamp(g_Config.iDisplayRefreshRate, 30, 1000);
+	return elapsed <= now - origin + frameLead;
+}
 
 static void EmscriptenMainLoop(void *arg) {
 	auto *state = (EmscriptenMainLoopState *)arg;
@@ -1697,7 +1735,7 @@ static void EmscriptenMainLoop(void *arg) {
 		emscripten_cancel_main_loop();
 		return;
 	}
-	if (emuThreadState == (int)EmuThreadState::DISABLED) {
+	if (emuThreadState == (int)EmuThreadState::DISABLED && EmscriptenNetworkFrameDue()) {
 		NativeFrame(graphicsContext);
 	}
 	if (g_QuitRequested || g_RestartRequested) {

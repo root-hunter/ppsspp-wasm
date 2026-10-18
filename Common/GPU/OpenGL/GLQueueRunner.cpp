@@ -222,6 +222,9 @@ void GLQueueRunner::RunInitSteps(const FastVec<GLRInitStep> &steps, bool skipGLC
 				glBindFragDataLocationIndexedEXT(program->program, 0, 1, "fragColor1");
 			}
 #endif
+#ifdef __EMSCRIPTEN__
+			program->uniformValues.Clear();
+#endif
 			glLinkProgram(program->program);
 
 			GLint linkStatus = GL_FALSE;
@@ -1055,6 +1058,10 @@ void GLQueueRunner::PerformRenderPass(const GLRStep &step, bool first, bool last
 			}
 			if (loc >= 0) {
 				_dbg_assert_(c.uniform4.count >=1 && c.uniform4.count <=4);
+#ifdef __EMSCRIPTEN__
+				if (!curProgram->uniformValues.Update(loc, (int)c.cmd, c.uniform4.v, c.uniform4.count * sizeof(float)))
+					break;
+#endif
 				switch (c.uniform4.count) {
 				case 1: glUniform1f(loc, c.uniform4.v[0]); break;
 				case 2: glUniform2fv(loc, 1, c.uniform4.v); break;
@@ -1074,6 +1081,10 @@ void GLQueueRunner::PerformRenderPass(const GLRStep &step, bool first, bool last
 			}
 			if (loc >= 0) {
 				_dbg_assert_(c.uniform4.count >=1 && c.uniform4.count <=4);
+#ifdef __EMSCRIPTEN__
+				if (!curProgram->uniformValues.Update(loc, (int)c.cmd, c.uniform4.v, c.uniform4.count * sizeof(GLuint)))
+					break;
+#endif
 				switch (c.uniform4.count) {
 				case 1: glUniform1uiv(loc, 1, (GLuint *)c.uniform4.v); break;
 				case 2: glUniform2uiv(loc, 1, (GLuint *)c.uniform4.v); break;
@@ -1093,6 +1104,10 @@ void GLQueueRunner::PerformRenderPass(const GLRStep &step, bool first, bool last
 			}
 			if (loc >= 0) {
 				_dbg_assert_(c.uniform4.count >=1 && c.uniform4.count <=4);
+#ifdef __EMSCRIPTEN__
+				if (!curProgram->uniformValues.Update(loc, (int)c.cmd, c.uniform4.v, c.uniform4.count * sizeof(GLint)))
+					break;
+#endif
 				switch (c.uniform4.count) {
 				case 1: glUniform1iv(loc, 1, (GLint *)c.uniform4.v); break;
 				case 2: glUniform2iv(loc, 1, (GLint *)c.uniform4.v); break;
@@ -1111,10 +1126,12 @@ void GLQueueRunner::PerformRenderPass(const GLRStep &step, bool first, bool last
 				loc = curProgram->GetUniformLoc(c.uniformStereoMatrix4.name);
 			}
 			if (loc >= 0) {
-				if (GetVRFBOIndex() == 0) {
-					glUniformMatrix4fv(loc, 1, false, c.uniformStereoMatrix4.mData);
-				} else {
-					glUniformMatrix4fv(loc, 1, false, c.uniformStereoMatrix4.mData + 16);
+				const float *matrix = c.uniformStereoMatrix4.mData + (GetVRFBOIndex() == 0 ? 0 : 16);
+#ifdef __EMSCRIPTEN__
+				if (curProgram->uniformValues.Update(loc, (int)c.cmd, matrix, 16 * sizeof(float)))
+#endif
+				{
+					glUniformMatrix4fv(loc, 1, false, matrix);
 				}
 			}
 			if (GetVRFBOIndex() == 1 || GetVRPassesCount() == 1) {
@@ -1133,6 +1150,10 @@ void GLQueueRunner::PerformRenderPass(const GLRStep &step, bool first, bool last
 				loc = curProgram->GetUniformLoc(c.uniformMatrix4.name);
 			}
 			if (loc >= 0) {
+#ifdef __EMSCRIPTEN__
+				if (!curProgram->uniformValues.Update(loc, (int)c.cmd, c.uniformMatrix4.m, 16 * sizeof(float)))
+					break;
+#endif
 				glUniformMatrix4fv(loc, 1, false, c.uniformMatrix4.m);
 			}
 			CHECK_GL_ERROR_IF_DEBUG();

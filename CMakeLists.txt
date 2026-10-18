@@ -320,6 +320,15 @@ include_directories(ext/glslang)
 include_directories(ext/glew)
 
 if(EMSCRIPTEN)
+	option(WASM_ADHOC_TESTS "Export the protocol-level socket integration probe" OFF)
+	option(WASM_THREADED_ADHOC "Run WLAN emulation on a pthread while the browser renders and receives packets" ON)
+	if(WASM_THREADED_ADHOC)
+		set_property(SOURCE SDL/SDLMain.cpp APPEND PROPERTY COMPILE_DEFINITIONS PPSSPP_WASM_THREADED_ADHOC=1)
+	endif()
+	if(WASM_ADHOC_TESTS)
+		add_link_options("-sEXPORTED_FUNCTIONS=_main,_ppssppNetProbe,_ppssppNetProbeByte")
+	endif()
+	add_link_options("-sEXPORTED_RUNTIME_METHODS=FS,SOCKFS,ccall,cwrap")
 	option(WASM_MAX_PERF "Enable aggressive WebAssembly release optimizations" ON)
 	option(WASM_ENABLE_LTO "Enable WebAssembly link-time optimization in release builds" OFF)
 	option(WASM_PRELOAD_ASSETS "Package PPSSPP assets into the Emscripten preload data file" ON)
@@ -1579,6 +1588,9 @@ else()
 		SDL/SDLMain.cpp
 		SDL/SDLGLGraphicsContext.cpp
 	)
+	if(EMSCRIPTEN AND WASM_ADHOC_TESTS)
+		list(APPEND nativeExtra SDL/WasmAdhocProbe.cpp)
+	endif()
 	if(NOT USE_LIBNX AND VULKAN)
 		list(APPEND nativeExtra
 			SDL/SDLVulkanGraphicsContext.cpp

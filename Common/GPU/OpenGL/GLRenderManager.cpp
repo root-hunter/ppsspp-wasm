@@ -1,4 +1,7 @@
 #include "ppsspp_config.h"
+#ifdef __EMSCRIPTEN__
+#include <emscripten/threading.h>
+#endif
 #include "GLRenderManager.h"
 #include "Common/GPU/OpenGL/GLFeatures.h"
 #include "Common/GPU/thin3d.h"
@@ -393,18 +396,21 @@ void GLRenderManager::BeginFrame(bool enableProfiling) {
 		// The browser main thread cannot safely block here: on WASM we also
 		// execute the queued GL work from this same thread.  Drain available
 		// render tasks until the previous use of this frame slot presents.
-		while (!frameData.readyForFence) {
-			lock.unlock();
-			if (!ThreadFrame(false)) {
-				sleep_ms(0, "wasm gl fence poll");
+		if (emscripten_is_main_runtime_thread()) {
+			while (!frameData.readyForFence) {
+				lock.unlock();
+				if (!ThreadFrame(false)) {
+					sleep_ms(0, "wasm gl fence poll");
+				}
+				lock.lock();
 			}
-			lock.lock();
-		}
-#else
-		while (!frameData.readyForFence) {
-			frameData.fenceCondVar.wait(lock);
-		}
+		} else
 #endif
+		{
+			while (!frameData.readyForFence) {
+				frameData.fenceCondVar.wait(lock);
+			}
+		}
 		frameData.readyForFence = false;
 	}
 
@@ -591,23 +597,23 @@ void GLRenderManager::FlushSync() {
 
 	{
 #ifdef __EMSCRIPTEN__
-		// On Emscripten there is no render thread (DISABLED emu thread mode).
-		// The queue is drained by ThreadFrameAvailable() from the main loop,
-		// but we are still inside NativeFrame() here, so we must drain inline.
-		// ThreadFrame(false) processes until PRESENT or until queue empty,
-		// and on empty it sets syncDone_ = true.
-		while (!syncDone_) {
-			ThreadFrame(false);
-		}
-		syncDone_ = false;
-#else
-		std::unique_lock<std::mutex> lock(syncMutex_);
-		// Wait for the flush to be hit, since we're syncing.
-		while (!syncDone_) {
-			VLOG("PUSH: Waiting for frame[%d].readyForFence = 1 (sync)", curFrame_);
-			syncCondVar_.wait(lock);
-		}
-		syncDone_ = false;
+		// Single-threaded Emscripten must drain inline. A pthread producer
+		// waits normally while the browser drains ThreadFrameAvailable().
+		if (emscripten_is_main_runtime_thread()) {
+			while (!syncDone_) {
+				ThreadFrame(false);
+			}
+			syncDone_ = false;
+		} else
 #endif
+		{
+			std::unique_lock<std::mutex> lock(syncMutex_);
+			// Wait for the flush to be hit, since we're syncing.
+			while (!syncDone_) {
+				VLOG("PUSH: Waiting for frame[%d].readyForFence = 1 (sync)", curFrame_);
+				syncCondVar_.wait(lock);
+			}
+			syncDone_ = false;
+		}
 	}
 }

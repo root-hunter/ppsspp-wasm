@@ -24,6 +24,7 @@
 #include <string>
 
 #include "Common/Net/SocketCompat.h"
+#include "Core/HLE/AdhocSocket.h"
 #include "Common/Data/Format/JSONReader.h"
 #include "Common/Data/Text/I18n.h"
 #include "Common/File/FileUtil.h"
@@ -2136,7 +2137,7 @@ int sceNetAdhocPdpCreate(const char *mac, int port, int bufferSize, u32 flag) {
 
 				// Create Internet UDP Socket
 				// Socket is remapped through adhocSockets
-				int usocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+				int usocket = CreateAdhocSocket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 				// Valid Socket produced
 				if (usocket != INVALID_SOCKET) {
 					// Change socket buffer size to be consistent on all platforms.
@@ -4137,7 +4138,7 @@ int RecreatePtpSocket(int ptpId) {
 
 	// Create a new socket
 	// Socket is remapped through adhocSockets
-	int tcpsocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	int tcpsocket = CreateAdhocSocket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 
 	// Valid Socket produced
 	if (tcpsocket < 0)
@@ -4329,7 +4330,7 @@ static int sceNetAdhocPtpOpen(const char *srcmac, int sport, const char *dstmac,
 
 				// Create Infrastructure Socket (?)
 				// Socket is remapped through adhocSockets
-				int tcpsocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+				int tcpsocket = CreateAdhocSocket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 
 				// Valid Socket produced
 				if (tcpsocket > 0) {
@@ -5019,7 +5020,7 @@ static int sceNetAdhocPtpListen(const char *srcmac, int sport, int bufsize, int 
 
 				// Create Infrastructure Socket (?)
 				// Socket is remapped through adhocSockets
-				int tcpsocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+				int tcpsocket = CreateAdhocSocket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 
 				// Valid Socket produced
 				if (tcpsocket > 0) {

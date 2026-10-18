@@ -18,6 +18,9 @@
 #include "Common/GPU/OpenGL/GLFrameData.h"
 #include "Common/GPU/OpenGL/GLCommon.h"
 #include "Common/GPU/OpenGL/GLMemory.h"
+#ifdef __EMSCRIPTEN__
+#include "Common/GPU/OpenGL/GLUniformCache.h"
+#endif
 
 class GLRInputLayout;
 class GLPushBuffer;
@@ -144,6 +147,9 @@ public:
 	};
 
 	GLuint program = 0;
+#ifdef __EMSCRIPTEN__
+	GLUniformValueCache uniformValues;
+#endif
 	std::vector<Semantic> semantics_;
 	std::vector<UniformLocQuery> queries_;
 	std::vector<Initializer> initialize_;

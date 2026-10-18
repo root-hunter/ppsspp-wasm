@@ -22,6 +22,7 @@
 // All credit goes to him!
 
 #include "ppsspp_config.h"
+#include "Core/HLE/AdhocSocket.h"
 
 #include <algorithm>
 #include <mutex>
@@ -78,6 +79,16 @@ char* dummyPeekBuf64k                 = NULL;
 int dummyPeekBuf64kSize               = 65536;
 int one                               = 1;
 std::atomic<bool> friendFinderRunning(false);
+#ifdef __EMSCRIPTEN__
+static std::atomic<bool> wasmReconnectRequested(false);
+extern "C" EMSCRIPTEN_KEEPALIVE int ppssppAdhocReconnect() {
+	if (!friendFinderRunning.load())
+		return -1;
+	wasmReconnectRequested.store(true);
+	return 0;
+}
+#endif
+
 SceNetAdhocctlPeerInfo * friends      = NULL;
 SceNetAdhocctlScanInfo * networks     = NULL;
 SceNetAdhocctlScanInfo * newnetworks  = NULL;
@@ -1375,6 +1386,12 @@ int friendFinder() {
 	// Log Startup
 	INFO_LOG(Log::sceNet, "FriendFinder: Begin of Friend Finder Thread");
 
+#ifdef __EMSCRIPTEN__
+	// The actual endpoint is a WSS URL owned by the browser adapter. No native
+	// DNS / adapter lookup is involved (AI_ADDRCONFIG is unsupported in SOCKFS).
+	g_adhocServerIP.in.sin_family = AF_INET;
+	inet_pton(AF_INET, "192.0.2.1", &g_adhocServerIP.in.sin_addr);
+#else
 	// Resolve and cache AdhocServer DNS
 	addrinfo* resolved = nullptr;
 	std::string err;
@@ -1393,11 +1410,33 @@ int friendFinder() {
 		}
 		net::DNSResolveFree(resolved);
 	}
+#endif
 	g_adhocServerIP.in.sin_port = htons(SERVER_PORT);
 
 	// Finder Loop
 	friendFinderRunning = true;
 	while (friendFinderRunning) {
+#ifdef __EMSCRIPTEN__
+		if (wasmReconnectRequested.exchange(false)) {
+			// Consume the UI request on the socket's owning thread. Rejoin is
+			// deliberately left to the game; an interrupted match cannot resume.
+			if (metasocket != (int)INVALID_SOCKET) {
+				shutdown((int)metasocket, SD_BOTH);
+				closesocket((int)metasocket);
+				metasocket = (int)INVALID_SOCKET;
+			}
+			g_adhocServerConnected = false;
+			peerlock.lock();
+			timeoutFriendsRecursive(friends);
+			peerlock.unlock();
+			rxpos = 0;
+			adhocctlState = ADHOCCTL_STATE_DISCONNECTED;
+			isAdhocctlBusy = false;
+			netAdhocGameModeEntered = false;
+			isAdhocctlNeedLogin = true;
+			notifyAdhocctlHandlers(ADHOCCTL_EVENT_DISCONNECT, 0);
+		}
+#endif
 		// Acquire Network Lock
 		//_acquireNetworkLock();
 
@@ -1476,6 +1515,22 @@ int friendFinder() {
 					//printf("Received %d Bytes of Data from Server\n", received);
 					INFO_LOG(Log::sceNet, "Received %d Bytes of Data from Adhoc Server", received);
 				}
+#ifdef __EMSCRIPTEN__
+				else if (received == 0 || (received < 0 && socket_errno != EAGAIN && socket_errno != EWOULDBLOCK)) {
+					// A closed browser transport must reach the PSP error path even
+					// when there is no further writable socket / outgoing ping.
+					g_adhocServerConnected = false;
+					shutdown((int)metasocket, SD_BOTH);
+					closesocket((int)metasocket);
+					metasocket = (int)INVALID_SOCKET;
+					peerlock.lock();
+					timeoutFriendsRecursive(friends);
+					peerlock.unlock();
+					rxpos = 0;
+					isAdhocctlBusy = false;
+					notifyAdhocctlHandlers(ADHOCCTL_EVENT_ERROR, SCE_NET_ADHOCCTL_ERROR_DISCONNECTED);
+				}
+#endif
 			}
 
 			// Calculate EnterGameMode Timeout to prevent waiting forever for disconnected players
@@ -1824,6 +1879,13 @@ int getLocalIp(sockaddr_in* SocketAddress) {
 		}
 	}
 #endif // !PPSSPP_PLATFORM(SWITCH)
+
+#ifdef __EMSCRIPTEN__
+	// Browser sockets have virtual addresses. Never probe a native adapter or
+	// open a datagram WebSocket to an external DNS server to infer a local IP.
+	inet_pton(AF_INET, "10.255.255.254", &SocketAddress->sin_addr);
+	return 0;
+#endif
 
 // Fallback if not connected to AdhocServer
 // getifaddrs first appeared in glibc 2.3, On Android officially supported since __ANDROID_API__ >= 24
@@ -2184,7 +2246,7 @@ int initNetwork(SceNetAdhocctlAdhocId *adhoc_id){
 	auto n = GetI18NCategory(I18NCat::NETWORKING);
 	int iResult = 0;
 	metasocket = (int)INVALID_SOCKET;
-	metasocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	metasocket = CreateAdhocSocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, true);
 	if (metasocket == INVALID_SOCKET){
 		ERROR_LOG(Log::sceNet, "Invalid socket");
 		return SOCKET_ERROR;
