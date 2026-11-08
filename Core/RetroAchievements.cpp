@@ -12,6 +12,12 @@
 // md5_hash(PSP_GAME/EBOOT.BIN)
 // hash = md5_finalize()
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#include <mutex>
+#include "Common/Data/Format/JSONWriter.h"
+#endif
+
 #include <algorithm>
 #include <set>
 #include <string>
@@ -159,6 +165,15 @@ bool g_isIdentifying = false;
 bool g_isLoggingIn = false;
 bool g_hasRichPresence = false;
 int g_loginResult;
+#ifdef __EMSCRIPTEN__
+static int g_browserLoginResult = RC_OK;
+static std::mutex g_browserMutex;
+static std::vector<std::function<void()>> g_browserCommands;
+static void QueueBrowserCommand(std::function<void()> command) {
+	std::lock_guard<std::mutex> lock(g_browserMutex);
+	g_browserCommands.push_back(std::move(command));
+}
+#endif
 
 double g_lastLoginAttemptTime;
 
@@ -482,6 +497,9 @@ static void event_handler_callback(const rc_client_event_t *event, rc_client_t *
 }
 
 static void login_token_callback(int result, const char *error_message, rc_client_t *client, void *userdata) {
+#ifdef __EMSCRIPTEN__
+	g_browserLoginResult = result;
+#endif
 	bool isInitialAttempt = userdata != nullptr;
 	switch (result) {
 	case RC_OK:
@@ -656,7 +674,11 @@ void Initialize() {
 	}
 
 	// Provide a logging function to simplify debugging
+#ifdef __EMSCRIPTEN__
+	rc_client_enable_logging(g_rcClient, RC_CLIENT_LOG_LEVEL_ERROR, log_message_callback);
+#else
 	rc_client_enable_logging(g_rcClient, RC_CLIENT_LOG_LEVEL_VERBOSE, log_message_callback);
+#endif
 	if (!g_Config.sAchievementsHost.empty()) {
 		// Custom host, only useful for debugging against non-prod RA environments.
 		rc_client_set_host(g_rcClient, g_Config.sAchievementsHost.c_str());
@@ -712,6 +734,9 @@ static void TryLoginByToken(bool isInitialAttempt) {
 }
 
 static void login_password_callback(int result, const char *error_message, rc_client_t *client, void *userdata) {
+#ifdef __EMSCRIPTEN__
+	g_browserLoginResult = result;
+#endif
 	auto di = GetI18NCategory(I18NCat::DIALOG);
 	switch (result) {
 	case RC_OK:
@@ -720,6 +745,7 @@ static void login_password_callback(int result, const char *error_message, rc_cl
 		const rc_client_user_t *user = rc_client_get_user_info(client);
 		g_Config.sAchievementsUserName = user->username;
 		NativeSaveSecret(RA_TOKEN_SECRET_NAME, std::string(user->token));
+		g_Config.Save("Achievements login");
 		OnAchievementsLoginStateChange();
 		g_OSD.Show(OSDType::MESSAGE_SUCCESS, di->T("Logged in!"), "", g_RAImageID);
 		break;
@@ -753,9 +779,12 @@ static void login_password_callback(int result, const char *error_message, rc_cl
 
 bool LoginAsync(const char *username, const char *password) {
 	auto di = GetI18NCategory(I18NCat::DIALOG);
-	if (IsLoggedIn() || std::strlen(username) == 0 || std::strlen(password) == 0)
+	if (!g_rcClient || g_isLoggingIn || IsLoggedIn() || std::strlen(username) == 0 || std::strlen(password) == 0)
 		return false;
 
+#ifdef __EMSCRIPTEN__
+	g_browserLoginResult = RC_OK;
+#endif
 	g_OSD.SetProgressBar("cheevos_async_login", di->T("Logging in..."), 0, 0, 0, 0.0f);
 
 	g_isLoggingIn = true;
@@ -764,6 +793,9 @@ bool LoginAsync(const char *username, const char *password) {
 }
 
 void Logout() {
+#ifdef __EMSCRIPTEN__
+	g_browserLoginResult = RC_OK;
+#endif
 	rc_client_logout(g_rcClient);
 	// remove secret from config
 	NativeClearSecret(RA_TOKEN_SECRET_NAME);
@@ -813,7 +845,109 @@ void FrameUpdate() {
 	rc_client_do_frame(g_rcClient);
 }
 
+#ifdef __EMSCRIPTEN__
+// Only public account/game information crosses this bridge. Token stays in the
+// native secret store; all rc_client mutations execute with the native UI loop.
+static void PublishBrowserState() {
+	static double nextUpdate = 0;
+	if (time_now_d() < nextUpdate) return;
+	nextUpdate = time_now_d() + 1.0;
+	json::JsonWriter out;
+	out.begin();
+	out.writeBool("enabled", g_Config.bAchievementsEnable);
+	out.writeBool("hardcore", g_Config.bAchievementsHardcoreMode);
+	out.writeBool("hardcoreActive", HardcoreModeActive());
+	out.writeBool("inGame", PSP_IsInited());
+	out.writeBool("busy", g_isLoggingIn || g_isIdentifying);
+	out.writeBool("loggedIn", g_rcClient && IsLoggedIn());
+	out.writeString("username", g_Config.sAchievementsUserName);
+	out.writeBool("loginError", g_loginResult != RC_OK || g_browserLoginResult != RC_OK);
+	const auto game = g_rcClient ? rc_client_get_game_info(g_rcClient) : nullptr;
+	out.writeString("game", game && game->title ? game->title : "");
+	out.writeUint("gameId", game ? game->id : 0);
+	rc_client_user_game_summary_t summary{};
+	if (g_rcClient) rc_client_get_user_game_summary(g_rcClient, &summary);
+	out.writeUint("total", summary.num_core_achievements);
+	out.writeUint("unlocked", summary.num_unlocked_achievements);
+	out.writeUint("points", summary.points_unlocked);
+	out.pushArray("achievements");
+	if (g_rcClient && game) {
+		auto list = rc_client_create_achievement_list(g_rcClient, RC_CLIENT_ACHIEVEMENT_CATEGORY_CORE,
+			RC_CLIENT_ACHIEVEMENT_LIST_GROUPING_LOCK_STATE);
+		if (list) {
+			for (uint32_t b = 0; b < list->num_buckets; ++b) {
+				const auto &bucket = list->buckets[b];
+				for (uint32_t i = 0; i < bucket.num_achievements; ++i) {
+					const auto a = bucket.achievements[i];
+					out.pushDict();
+					out.writeUint("id", a->id);
+					out.writeString("title", DeNull(a->title));
+					out.writeString("description", DeNull(a->description));
+					out.writeUint("points", a->points);
+					out.writeBool("unlocked", a->state == RC_CLIENT_ACHIEVEMENT_STATE_UNLOCKED);
+					out.writeString("progress", a->measured_progress);
+					out.pop();
+				}
+			}
+			rc_client_destroy_achievement_list(list);
+		}
+	}
+	out.pop();
+	out.end();
+	const auto data = out.str();
+	MAIN_THREAD_EM_ASM({ Module['retroAchievementsState'] = JSON.parse(UTF8ToString($0)); }, data.c_str());
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE void PPSSPP_AchievementsSettings(int enabled, int hardcore) {
+	QueueBrowserCommand([enabled, hardcore]() {
+		if (PSP_IsInited() || g_isLoggingIn || g_isIdentifying) return;
+		g_Config.bAchievementsEnable = enabled != 0;
+		g_Config.bAchievementsHardcoreMode = hardcore != 0;
+		UpdateSettings();
+		if (g_rcClient) rc_client_set_hardcore_enabled(g_rcClient, hardcore != 0);
+		g_Config.Save("Browser achievements settings");
+	});
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE void PPSSPP_AchievementsLogin(const char *username, const char *password) {
+	std::string user = username ? username : "", pass = password ? password : "";
+	if (user.empty() || user.size() > 256 || pass.empty() || pass.size() > 1024) return;
+	QueueBrowserCommand([user, pass]() {
+		if (!g_rcClient || PSP_IsInited() || g_isLoggingIn || g_isIdentifying || IsLoggedIn()) return;
+		LoginAsync(user.c_str(), pass.c_str());
+	});
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE void PPSSPP_AchievementsLogout() {
+	QueueBrowserCommand([]() {
+		if (!g_rcClient || PSP_IsInited() || g_isLoggingIn || g_isIdentifying) return;
+		Logout();
+		g_Config.sAchievementsUserName.clear();
+		g_Config.Save("Browser achievements logout");
+	});
+}
+#endif
+
+#ifdef __EMSCRIPTEN__
+// The dashboard suspends the native loop. Process sign-in at the game browser
+// without advancing an emulated game.
+extern "C" EMSCRIPTEN_KEEPALIVE void PPSSPP_AchievementsPoll() {
+	if (PSP_IsInited()) return;
+	g_DownloadManager.Update();
+	Idle();
+}
+#endif
+
 void Idle() {
+#ifdef __EMSCRIPTEN__
+	std::vector<std::function<void()>> commands;
+	{
+		std::lock_guard<std::mutex> lock(g_browserMutex);
+		commands.swap(g_browserCommands);
+	}
+	for (auto &command : commands) command();
+	PublishBrowserState();
+#endif
 	rc_client_idle(g_rcClient);
 
 	double now = time_now_d();

@@ -8,7 +8,97 @@
 #include "Common/System/OSD.h"
 #include "Common/System/System.h"
 
+#ifdef __EMSCRIPTEN__
+#include <atomic>
+#include <cstring>
+#include <cstdlib>
+#include <emscripten.h>
+#include <emscripten/fetch.h>
+#include <emscripten/threading.h>
+#endif
+
 namespace http {
+
+#ifdef __EMSCRIPTEN__
+// Completed responses are consumed by RequestManager::Update on the UI thread.
+// No synchronous XHR or native sockets on the browser main thread.
+class BrowserRequest final : public Request {
+public:
+	BrowserRequest(RequestMethod method, std::string_view url, std::string_view data, std::string_view mime,
+                const Path &outfile, RequestFlags flags, std::string_view name)
+		: Request(method, url, name, &cancelled_, flags), data_(data), mime_(mime) { outfile_ = outfile; }
+	~BrowserRequest() override { Join(); }
+	void Start() override {
+		// The WLAN worker never yields to a JS event loop. Own XHRs on the
+		// browser thread so responses arrive during threaded gameplay too.
+		if (!emscripten_is_main_runtime_thread()) {
+			emscripten_sync_run_in_main_runtime_thread(EM_FUNC_SIG_VI, StartOnMain, this);
+			return;
+		}
+		emscripten_fetch_attr_t attr;
+		emscripten_fetch_attr_init(&attr);
+		strcpy(attr.requestMethod, method_ == RequestMethod::POST ? "POST" : "GET");
+		attr.attributes = EMSCRIPTEN_FETCH_LOAD_TO_MEMORY;
+		attr.timeoutMSecs = 30000;
+		attr.userData = this;
+		attr.onsuccess = attr.onerror = [](emscripten_fetch_t *fetch) {
+			auto self = static_cast<BrowserRequest *>(fetch->userData);
+			self->resultCode_ = fetch->status ? fetch->status : -1;
+			if (fetch->numBytes && fetch->data) {
+				memcpy(self->buffer_.Append(fetch->numBytes), fetch->data, fetch->numBytes);
+			}
+			self->completed_ = true;
+		};
+		const char *headers[] = {"Accept", acceptMime_, nullptr, nullptr, nullptr};
+		if (!mime_.empty()) { headers[2] = "Content-Type"; headers[3] = mime_.c_str(); }
+		attr.requestHeaders = headers;
+		attr.requestData = data_.data();
+		attr.requestDataSize = data_.size();
+		// The shell supplies an HTTPS gateway for RA's API and badge images (CORS).
+		char *mapped = (char *)EM_ASM_PTR({
+			const url = new URL(UTF8ToString($0));
+			let target = url.href;
+			if (['retroachievements.org', 'media.retroachievements.org'].includes(url.hostname)) {
+				url.protocol = 'https:';
+				const proxy = Module['retroAchievementsProxy'];
+				if (proxy) target = proxy + '?url=' + encodeURIComponent(url.href);
+				else target = url.href;
+			}
+			return stringToNewUTF8(target);
+		}, url_.c_str());
+		fetch_ = emscripten_fetch(&attr, mapped);
+		free(mapped);
+		if (!fetch_) { resultCode_ = -1; completed_ = true; }
+	}
+	bool Done() override {
+		if (cancelled_ && !completed_) { Join(); resultCode_ = -1000; completed_ = true; }
+		if (!completed_) return false;
+		if (!finalized_) {
+			failed_ = resultCode_ != 200;
+			if (!failed_ && !outfile_.empty())
+				failed_ = !buffer_.FlushToFile(outfile_, !(flags_ & RequestFlags::KeepInMemory));
+			progress_.Update(0, 0, true);
+			finalized_ = true;
+		}
+		return true;
+	}
+	bool Failed() const override { return failed_; }
+	void Join() override {
+		if (!emscripten_is_main_runtime_thread()) {
+			emscripten_sync_run_in_main_runtime_thread(EM_FUNC_SIG_VI, JoinOnMain, this);
+			return;
+		}
+		if (fetch_) { emscripten_fetch_close(fetch_); fetch_ = nullptr; }
+	}
+private:
+	static void StartOnMain(BrowserRequest *request) { request->Start(); }
+	static void JoinOnMain(BrowserRequest *request) { request->Join(); }
+	std::string data_, mime_;
+	emscripten_fetch_t *fetch_ = nullptr;
+	std::atomic<bool> completed_{false};
+	bool finalized_ = false, failed_ = false;
+};
+#endif
 
 Request::Request(RequestMethod method, std::string_view url, std::string_view name, bool *cancelled, RequestFlags flags)
 	: method_(method), url_(url), name_(name), progress_(cancelled), flags_(flags) {
@@ -60,6 +150,9 @@ Path RequestManager::UrlToCachePath(const std::string_view url) {
 }
 
 static std::shared_ptr<Request> CreateRequest(RequestMethod method, std::string_view url, std::string_view postdata, std::string_view postMime, const Path &outfile, RequestFlags flags, net::ResolveFunc customResolve, std::string_view name) {
+#ifdef __EMSCRIPTEN__
+	return std::make_shared<BrowserRequest>(method, url, postdata, postMime, outfile, flags, name);
+#else
 	if (IsHttpsUrl(url) && System_GetPropertyBool(SYSPROP_SUPPORTS_HTTPS)) {
 #ifndef HTTPS_NOT_AVAILABLE
 		return std::make_shared<HTTPSRequest>(method, url, postdata, postMime, outfile, flags, name);
@@ -69,6 +162,7 @@ static std::shared_ptr<Request> CreateRequest(RequestMethod method, std::string_
 	} else {
 		return std::make_shared<HTTPRequest>(method, url, postdata, postMime, outfile, flags, customResolve, name);
 	}
+#endif
 }
 
 // Compatible with StartDownload

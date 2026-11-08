@@ -908,7 +908,7 @@ bool System_GetPropertyBool(SystemProperty prop) {
 		return true;
 	case SYSPROP_SUPPORTS_OPEN_FILE_IN_EDITOR:
 		return true;  // FileUtil.cpp: OpenFileInEditor
-#ifndef HTTPS_NOT_AVAILABLE
+#if !defined(HTTPS_NOT_AVAILABLE) || defined(__EMSCRIPTEN__)
 	case SYSPROP_SUPPORTS_HTTPS:
 		return !g_Config.bDisableHTTPS;
 #endif
